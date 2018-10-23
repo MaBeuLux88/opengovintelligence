@@ -7,6 +7,7 @@
                     Leaflet.markercluster.js - (C) Dave Leaver https://github.com/danzel
                     Leaflet.Control.Geocoder.js - (C) Per Liedman https://github.com/perliedman/leaflet-control-geocoder
                     Fontawesome - (C) Fonticons, Inc. All rights reserved https://fontawesome.com
+                    Chroma.js - (C) Gregor Aisch https://github.com/gka/chroma.js/
                     All other code by Trafford Data Lab
 
     Licence:        Leaflet: https://github.com/Leaflet/Leaflet/blob/master/LICENSE
@@ -15,12 +16,182 @@
                     Leaflet.markercluster: https://github.com/Leaflet/Leaflet.markercluster/blob/master/MIT-LICENCE.txt
                     Leaflet.Control.Geocoder: https://github.com/perliedman/leaflet-control-geocoder/blob/master/LICENSE
                     Fontawesome: https://fontawesome.com/license
+                    Chroma.js: https://github.com/gka/chroma.js/blob/master/LICENSE
+                               https://github.com/gka/chroma.js/blob/master/LICENSE-colors
                     Trafford Data Lab: https://github.com/traffordDataLab/opengovintelligence/blob/master/LICENSE
 
     Notes:          Trafford Data Lab Leaflet.reachability plugin uses © Powered by openrouteservice https://openrouteservice.org/
 */
 
 // ######### FUNCTIONS #########
+/*
+    Purpose:        Converts the standard format JSON output by a SPARQL query into keyed JSON which is our preferred format as it can easily be bound to maps etc.
+    Dependencies:   None
+*/
+function labConvertSparqlResultJsonToKeyedJson(json, objectKey, objOptions) {
+    // objectKey is the name of one of the vars returned in the data from the SPARQL query and is the key whose value we will be binding the other data items to.  Commonly this might be the ONS code of a geographic area allowing us to easily map the data
+    var def_forceType = null;
+
+    var newJson = {};
+    var arrDataKeys = [];
+    var objectKeyValue;
+
+    var arrVars = json.head.vars;			// Where all the variables used in the SPARQL query are stored, these becomes keys in the returned dataset object
+    var arrData = json.results.bindings;	// Where all the data is stored for each of the variables above
+
+    if (objOptions != null) {
+    	if (objOptions["forceType"] != null) def_forceType = String(objOptions['forceType']).toLowerCase();		// optional parameter to force all values to be a specific type, e.g. integer etc.
+    }
+
+    /*
+        Type conversion:
+        ----------------
+        The values returned in the JSON will be strings - EVEN IF THEY ARE NOT STORED AS STRINGS IN THE TRIPLE STORE
+        This is part of the RDF Literal specification: https://www.w3.org/TR/rdf11-concepts/#section-Graph-Literal
+        However the actual datatype of the value could/should be contained in a key/value pair e.g. "datatype" : "http://www.w3.org/2001/XMLSchema#integer"
+        We can use this to determine the correct type for the value, or we can force the type if we wish via the def_forceType param
+        If we want to force the type, we don't want to keep testing the "datatype" key/value so we set a flag forceTypeConversion to true
+        If we do decide to force the type - all data items will be converted to this type, therefore this is not suitable for mixed types datasets
+    */
+    var tempVal;                        // local storage for the data values found in the JSON before they are converted to their correct types
+    var tempType;                       // local storage for the data type if we are determining it from the data
+    var valType;                        // the type we are going to convert the data to - determined either from the def_forceType param or from the data itself
+    var forceTypeConversion = false;    // whether we are forcing the conversion - saves on processing if we are
+
+    if (def_forceType != null) {
+        if (def_forceType === "integer" || def_forceType === "float" || def_forceType === "boolean" || def_forceType === "string") {
+            valType = def_forceType;
+            forceTypeConversion = true;
+        }
+    }
+
+    // Iterate through the variables section of the JSON to build up an array of data keys to populate our new object
+    for (var i = 0; i < arrVars.length; i++) {
+        // So long as the variable we are looking at is not the objectKey variable, add it to the array
+        if (arrVars[i] != objectKey) arrDataKeys.push(arrVars[i]);
+    }
+
+    // Iterate through the data sections of the JSON creating our new JSON object structure
+    for (var i = 0; i < arrData.length; i++) {
+        objectKeyValue = arrData[i][objectKey].value;     // get the objectKey value, e.g. "E08000009"
+
+        newJson[objectKeyValue] = {};                      // make a new key with the objectKey value within the new JSON object we are creating and make it equal to another object
+
+        // This sub-loop iterates through all the data items other than the feature key and adds them to the new data object
+        for (var j = 0; j < arrDataKeys.length; j++) {
+
+            // Temporarily store the value in a local variable ready to determine its type
+            tempVal = arrData[i][arrDataKeys[j]]["value"];
+
+            // Determine type from data if not forced - NOTE: this could be expanded for more datatypes if necessary at a later date
+            if (!forceTypeConversion) {
+                tempType = arrData[i][arrDataKeys[j]]["datatype"];
+
+                if (tempType != null) {
+                    if (tempType.lastIndexOf("integer") > -1) {
+                        valType = "integer";
+                    }
+                    else if (tempType.lastIndexOf("float") > -1 || tempType.lastIndexOf("double") > -1 || tempType.lastIndexOf("decimal") > -1) {
+                        valType = "float";
+                    }
+                    else if (tempType.lastIndexOf("boolean") > -1) {
+                        valType = "boolean";
+                    }
+                    else {
+                        valType = "string";
+                    }
+                }
+                else {
+                    valType = "string";
+                }
+            }
+
+            // Convert value to the correct type
+            switch (valType) {
+                case "integer":
+                    tempVal = parseInt(tempVal);
+                    break;
+
+                case "float":
+                    tempVal = parseFloat(tempVal);
+                    break;
+
+                case "boolean":
+                    tempVal = (tempVal == "true" || tempVal == "1");
+                    break;
+
+                default:
+                    // Treat as a string
+                    tempVal = String(tempVal);
+            }
+
+            // Add the value to the key;
+            newJson[objectKeyValue][arrDataKeys[j]] = tempVal;
+        }
+    }
+
+    return newJson;
+}
+
+
+/*
+    Purpose:        Creates a chroma.js colour object for automatically creating choropleth colour ranges
+    Dependencies:   chroma.js (external library), labError (internal library)
+*/
+function LabChroma(objOptions) {
+    try {
+        // properties
+        this.data = (objOptions["data"] == null) ? [] : objOptions["data"];                                     // The dataset which we want the colour ranges to be based on
+        this.palette = (objOptions["palette"] == null) ? "Purples" : objOptions["palette"];                     // Either a string value or an array containing anything from a colour name, hex value, rgb value, array of colour strings, ColorBrewer palette string etc. etc.
+        this.paletteMode = (objOptions["paletteMode"] == null) ? "lab" : String(objOptions["paletteMode"]);     // The colour mode is how the interpolations are worked out. Could be 'rbg', 'lab', 'hsl' etc. Apparently 'lab' gives nicer colour ranges for maps so that's the default
+        this.hasBreaks = (objOptions["hasBreaks"] == false) ? false : true;                                     // Whether we want class breaks or a continuous colour range
+
+        if (this.hasBreaks) {
+            this.breakMode = (objOptions["breakMode"] == null) ? "q" : String(objOptions["breakMode"]);         // Do we want the class breaks based on [q]uantiles, [k]-means or [e]ven distributions
+            this.breakNum = (objOptions["breakNum"] == null) ? 5 : parseInt(objOptions["breakNum"]);            // The number of class breaks we want, default is 5
+        }
+        else {
+            // NOTE: we always need a limits object creating even if we are having a continuous colour range because the limits object gives us the domain (range) of the dataset very easily.
+            this.breakMode = "e";       // We want an even distribution of the colour across the range
+            this.breakNum = 100;        // By setting a high number of breaks, a legend created from this chroma object will look like a continous range of colour, rather than 'steps' as you would get with 5 etc.
+        }
+
+        /*
+        Outputs - these are properties which are read out of the object, created from the input properties.
+        this.limits is the array of class breaks for the data set, going from the minimum through to the maximum value in the dataset
+        this.getColor is the actual chroma object which we get a colour value output from a numeric value input.  The input lies within the limits of the data set
+        */
+        this.limits = chroma.limits(this.data, this.breakMode, this.breakNum);
+        this.getColor = chroma.scale(this.palette).domain([this.limits[0], this.limits[this.limits.length - 1]]).mode(this.paletteMode);    // Set up the main chroma object
+
+        if (this.hasBreaks) this.getColor.classes(this.limits)  // Add on the classes aspect if we want class breaks
+    }
+    catch(e) {
+        throw new LabException("Error in LabChroma(). Error occurred trying to create a chroma.js object: " + e.description);
+    }
+}
+
+
+/*
+    Purpose:        For returning a single dimension data array of any key's values from a json object with the following structure:
+				    {
+				    	"objectKey1": { "dataKey1": value, "dataKey2": value, ... "dataKeyN": value },
+				    	"objectKey2": { "dataKey1": value, "dataKey2": value, ... "dataKeyN": value }
+				    };
+				    Useful for providing the data for charts and chroma objects
+    Dependencies:   None
+*/
+function labGetDataArrayFromKeyedJson(json, dataKey) {
+    var arrData = [];
+
+    for (var objKey in json) {
+        if (json.hasOwnProperty(objKey) && json[objKey].hasOwnProperty(dataKey)) arrData.push(json[objKey][dataKey]);  // The check doesn't result in an error if false as it might be plausible for some of the items in the JSON to not have data of the type we are looking for
+    }
+
+    return arrData;
+}
+
+
 // To setup each feature within GeoJSON
 function featureEvents (feature, layer) {
     // we need to discover the feature type - remember it is valid for this to be null!
@@ -112,8 +283,10 @@ function resetFeatureStyle() {
             app.reachabilityControl.isolinesGroup.resetStyle(layer);
         }
         else {
-            // The feature is a polygon from a geography boundary. Easier to just set the style back to the default than resetting it via the L.geoJSON method
-            layer.setStyle(app.poly);
+            // The feature is a polygon from a geography boundary/choropleth
+            for (key in app.objGeographies) {
+                if (app.objGeographies[key].hasLayer(layer)) app.objGeographies[key].resetStyle(layer);
+            }
         }
 
         app.featureCache = null; // clear the cache to prevent a situation where no feature is currently selected but the cache still contains the previously selected layer
@@ -357,7 +530,6 @@ app.geocoder.on('markgeocode', function(result) {
 });
 
 
-
 // Add the reachability plugin
 app.reachabilityControl = labSetupReachabilityPlugin({
     // Common options are taken care of in the function, however the options below are extra
@@ -513,11 +685,64 @@ labAjax('apps/signpost/datasets.json', function (data) {
 });
 
 
-// ######### SPATIAL GEOGRAPHY LAYERS/LABELS #########
+// ######### SPATIAL GEOGRAPHY LAYERS/LABELS/CHOROPLETHS #########
 app.objGeographies = {};   // object to hold all the boundary L.geoJSON objects so that we can test in a loop for which layer belongs to which geography
+
+app.endpoint = 'http://gmdatastore.org.uk/sparql.json'; // linked data enpoint URL
+
+// Query for obtaining the claimant count percentage by ward
+app.claimantChoroQry = 'SELECT DISTINCT ?area_name ?area_code ?percent ';
+app.claimantChoroQry +='WHERE {?metcty <http://www.w3.org/2000/01/rdf-schema#label> "E11000001" .';
+app.claimantChoroQry +='?inmetcty <http://publishmydata.com/def/ontology/spatial/within> ?metcty .';
+app.claimantChoroQry +='?wards <http://publishmydata.com/def/ontology/spatial/within> ?inmetcty .';
+app.claimantChoroQry +='?wards <http://statistics.data.gov.uk/def/statistical-entity#code> <http://statistics.data.gov.uk/id/statistical-entity/E05> .';
+app.claimantChoroQry +='?wards <http://statistics.data.gov.uk/def/statistical-geography#officialname> ?area_name.';
+app.claimantChoroQry +='?wards <http://www.w3.org/2000/01/rdf-schema#label> ?area_code.';
+app.claimantChoroQry +='?s2 <http://purl.org/linked-data/cube#dataSet> <http://gmdatastore.org.uk/data/claimant-count> . ';
+app.claimantChoroQry +='?s2 <http://purl.org/linked-data/sdmx/2009/dimension#refArea> ?wards . ';
+app.claimantChoroQry +='?s2 <http://gmdatastore.org.uk/def/measure-properties/percent> ?percent . ';
+app.claimantChoroQry +='?s2 <http://purl.org/linked-data/sdmx/2009/dimension#refPeriod> <http://reference.data.gov.uk/id/month/2018-07> .}';
+app.claimantChoroQry = 'query=' + encodeURIComponent(app.claimantChoroQry);
+
 
 // Add the LA boundaries within GM
 labAjax('https://www.trafforddatalab.io/spatial_data/local_authority/2016/gm_local_authority_full_resolution.geojson', function (data) {
     app.objGeographies['LA'] = L.geoJSON(data, { attribution: app.attributionOS, style: app.poly, onEachFeature: featureEvents }).addTo(app.map);
     app.map.fitBounds(app.objGeographies['LA'].getBounds()); // adjust the zoom to fit the boundary to the screen size
 });
+
+
+// --- Choropleth layer for claimant count percentage ---
+startLabSpinner();  // inform the user that something is loading
+
+labAjax('https://www.trafforddatalab.io/spatial_data/ward/2017/gm_ward_full_resolution.geojson', function (wardGeoJson) {
+
+    // Load the claimant data from the endpoint
+    labAjax(app.endpoint , function (dataFromEndpoint) {
+        // Convert data returned from the endpoint into the format we need to easily bind to the geography
+        var claimantData = labConvertSparqlResultJsonToKeyedJson(dataFromEndpoint, 'area_code');
+
+        // Create chroma object to provide the colour values for the choropleth layer
+        var chroma = new LabChroma({ data: labGetDataArrayFromKeyedJson(claimantData, 'percent'), palette: 'Blues' });
+
+        // Create Leaflet GeoJSON layer
+        app.objGeographies['claimantCount'] = L.geoJSON(wardGeoJson, { attribution: app.attributionOS, style: function (feature) {
+            // Take this opportunity to also bind the data to the feature!
+            var claimantCountPerc = claimantData[feature.properties.area_code].percent;
+            feature.properties['Claimant Count %'] = claimantCountPerc;
+
+            // Return the styling object
+            return {
+                fillColor: chroma.getColor(claimantData[feature.properties.area_code].percent),
+                fillOpacity: 0.5,
+                color: '#212121',
+                weight: 2
+            };
+        }, onEachFeature: featureEvents }).addTo(app.map);
+
+        stopLabSpinner();
+
+    }, { data: app.claimantChoroQry, method: 'POST', header: [{ header: 'Accept', value: 'application/sparql-results+json' }, { header: 'Content-Type', value: 'application/x-www-form-urlencoded'}] });
+
+}, { cache: true });    // Cache the spatial data in case we need again for another choropleth layer
+// ------------------------------------------------------
