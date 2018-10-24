@@ -282,11 +282,14 @@ function resetFeatureStyle() {
             // The feature is an isoline drawn with the reachability plugin
             app.reachabilityControl.isolinesGroup.resetStyle(layer);
         }
-        else {
-            // The feature is a polygon from a geography boundary/choropleth
-            for (key in app.objGeographies) {
-                if (app.objGeographies[key].hasLayer(layer)) app.objGeographies[key].resetStyle(layer);
+        else if (isChoroplethLayer(layer)) {
+            for (key in app.objChoropleths) {
+                if (app.objChoropleths[key].hasLayer(layer)) app.objChoropleths[key].resetStyle(layer);
             }
+        }
+        else {
+            // The feature is a polygon from a geography boundary. Easier to just set the style back to the default than resetting it via the L.geoJSON method
+            layer.setStyle(app.poly);
         }
 
         app.featureCache = null; // clear the cache to prevent a situation where no feature is currently selected but the cache still contains the previously selected layer
@@ -468,9 +471,76 @@ function isGeographyLayer(layer) {
     return false;
 }
 
+// Determines whether the layer provided is a choropleth layer
+function isChoroplethLayer(layer) {
+    for (key in app.objChoropleths) {
+        if (app.objChoropleths[key].hasLayer(layer)) return true;
+    }
+
+    return false;
+}
+
 // Determines whether the layer provided is a dataset layer
 function isDatasetLayer(layer) {
     return (app.datasetLayer != null && app.datasetLayer.hasLayer(layer));
+}
+
+// Handles adding and removing choropleth layers
+function loadChoroplethLayer(layer) {
+    if (layer == '') {
+        // we need to remove the current choropleth
+        for (key in app.objChoropleths) {
+            if (app.map.hasLayer(app.objChoropleths[key])) app.map.removeLayer(app.objChoropleths[key]);
+        }
+    }
+    else if (app.objChoropleths[layer] != null) {
+        app.objChoropleths[layer].addTo(app.map);
+    }
+    else if (layer == 'claimantCount') {
+        // --- Choropleth layer for claimant count percentage ---
+        startLabSpinner();  // inform the user that something is loading
+
+        labAjax('https://www.trafforddatalab.io/spatial_data/ward/2017/gm_ward_full_resolution.geojson', function (wardGeoJson) {
+
+            // Load the claimant data from the endpoint
+            labAjax(app.endpoint , function (dataFromEndpoint) {
+                if (dataFromEndpoint != null) {
+                    // Convert data returned from the endpoint into the format we need to easily bind to the geography
+                    var claimantData = labConvertSparqlResultJsonToKeyedJson(dataFromEndpoint, 'area_code');
+
+                    // Create chroma object to provide the colour values for the choropleth layer
+                    var chroma = new LabChroma({ data: labGetDataArrayFromKeyedJson(claimantData, 'percent'), palette: 'Blues' });
+
+                    // Rename the property variables in the ward GeoJson for clarity
+                    for (var i = 0; i < wardGeoJson['features'].length; i++) {
+                        var newProps = {
+                            'Ward code': wardGeoJson['features'][i].properties.area_code,
+                            'Ward name': wardGeoJson['features'][i].properties.area_name,
+                            'Claimant count %': claimantData[wardGeoJson['features'][i].properties.area_code].percent
+                        };
+
+                        wardGeoJson['features'][i].properties = newProps;
+                    }
+
+                    // Create Leaflet GeoJSON layer
+                    app.objChoropleths['claimantCount'] = L.geoJSON(wardGeoJson, { attribution: app.attributionOS, style: function (feature) {
+                        // Return the styling object
+                        return {
+                            fillColor: chroma.getColor(feature.properties['Claimant count %']),
+                            fillOpacity: 0.5,
+                            color: '#212121',
+                            weight: 2
+                        };
+                    }, onEachFeature: featureEvents }).addTo(app.map);
+                }
+
+                stopLabSpinner();
+
+            }, { data: app.claimantChoroQry, method: 'POST', header: [{ header: 'Accept', value: 'application/sparql-results+json' }, { header: 'Content-Type', value: 'application/x-www-form-urlencoded'}] });
+
+        }, { cache: true });    // Cache the spatial data in case we need again for another choropleth layer
+        // ------------------------------------------------------
+    }
 }
 
 
@@ -619,6 +689,11 @@ labAjax('apps/signpost/datasets.json', function (data) {
         "legend": ""        // OPTIONAL
     }
     */
+
+    // Before creating in the select list for the datasets create one for the choropleth layers
+    var choroplethSelect = '<select name="frmChoroplethList" onChange="loadChoroplethLayer(this.value)" class="datasetSelect"><option value="" selected="selected">Select a data layer to display...</option>';
+    choroplethSelect += '<option value="claimantCount">Claimant count percentage</option></select>';
+
     app.objDatasets = data;  // store the dataset data
 
     var arrSelectList = [];     // array to hold the contents of the select list to choose the dataset to visualise
@@ -675,7 +750,7 @@ labAjax('apps/signpost/datasets.json', function (data) {
     datasetSelect += '</select>';
 
     // Add the dataset chooser UI to the filter container along with the element to toggle point data clustering
-    app.updateFilterGUI(datasetSelect + '<div id="toggleClusteringContainer" class="hideContent"><input type="checkbox" id="toggleClustering" onClick="toggleClustering()"/><label for="toggleClustering" class="toggleCluster">cluster markers</label></div>');
+    app.updateFilterGUI(choroplethSelect + datasetSelect + '<div id="toggleClusteringContainer" class="hideContent"><input type="checkbox" id="toggleClustering" onClick="toggleClustering()"/><label for="toggleClustering" class="toggleCluster">cluster markers</label></div>');
 
     // Store a reference to the container for the point data clustering control so that we can show/hide by adding or removing a CSS class
     app.toggleClusterContainer = document.getElementById('toggleClusteringContainer');
@@ -686,7 +761,8 @@ labAjax('apps/signpost/datasets.json', function (data) {
 
 
 // ######### SPATIAL GEOGRAPHY LAYERS/LABELS/CHOROPLETHS #########
-app.objGeographies = {};   // object to hold all the boundary L.geoJSON objects so that we can test in a loop for which layer belongs to which geography
+app.objGeographies = {};   // object to hold all the boundary L.geoJSON objects
+app.objChoropleths = {};   // object to hold the choropleth data layers
 
 app.endpoint = 'http://gmdatastore.org.uk/sparql.json'; // linked data enpoint URL
 
@@ -711,7 +787,7 @@ labAjax('https://www.trafforddatalab.io/spatial_data/local_authority/2016/gm_loc
     app.map.fitBounds(app.objGeographies['LA'].getBounds()); // adjust the zoom to fit the boundary to the screen size
 });
 
-
+/*
 // --- Choropleth layer for claimant count percentage ---
 startLabSpinner();  // inform the user that something is loading
 
@@ -719,26 +795,35 @@ labAjax('https://www.trafforddatalab.io/spatial_data/ward/2017/gm_ward_full_reso
 
     // Load the claimant data from the endpoint
     labAjax(app.endpoint , function (dataFromEndpoint) {
-        // Convert data returned from the endpoint into the format we need to easily bind to the geography
-        var claimantData = labConvertSparqlResultJsonToKeyedJson(dataFromEndpoint, 'area_code');
+        if (dataFromEndpoint != null) {
+            // Convert data returned from the endpoint into the format we need to easily bind to the geography
+            var claimantData = labConvertSparqlResultJsonToKeyedJson(dataFromEndpoint, 'area_code');
 
-        // Create chroma object to provide the colour values for the choropleth layer
-        var chroma = new LabChroma({ data: labGetDataArrayFromKeyedJson(claimantData, 'percent'), palette: 'Blues' });
+            // Create chroma object to provide the colour values for the choropleth layer
+            var chroma = new LabChroma({ data: labGetDataArrayFromKeyedJson(claimantData, 'percent'), palette: 'Blues' });
 
-        // Create Leaflet GeoJSON layer
-        app.objGeographies['claimantCount'] = L.geoJSON(wardGeoJson, { attribution: app.attributionOS, style: function (feature) {
-            // Take this opportunity to also bind the data to the feature!
-            var claimantCountPerc = claimantData[feature.properties.area_code].percent;
-            feature.properties['Claimant Count %'] = claimantCountPerc;
+            // Rename the property variables in the ward GeoJson for clarity
+            for (var i = 0; i < wardGeoJson['features'].length; i++) {
+                var newProps = {
+                    'Ward code': wardGeoJson['features'][i].properties.area_code,
+                    'Ward name': wardGeoJson['features'][i].properties.area_name,
+                    'Claimant count %': claimantData[wardGeoJson['features'][i].properties.area_code].percent
+                };
 
-            // Return the styling object
-            return {
-                fillColor: chroma.getColor(claimantData[feature.properties.area_code].percent),
-                fillOpacity: 0.5,
-                color: '#212121',
-                weight: 2
-            };
-        }, onEachFeature: featureEvents }).addTo(app.map);
+                wardGeoJson['features'][i].properties = newProps;
+            }
+
+            // Create Leaflet GeoJSON layer
+            app.objChoropleths['claimantCount'] = L.geoJSON(wardGeoJson, { attribution: app.attributionOS, style: function (feature) {
+                // Return the styling object
+                return {
+                    fillColor: chroma.getColor(feature.properties['Claimant count %']),
+                    fillOpacity: 0.5,
+                    color: '#212121',
+                    weight: 2
+                };
+            }, onEachFeature: featureEvents }).addTo(app.map);
+        }
 
         stopLabSpinner();
 
@@ -746,3 +831,4 @@ labAjax('https://www.trafforddatalab.io/spatial_data/ward/2017/gm_ward_full_reso
 
 }, { cache: true });    // Cache the spatial data in case we need again for another choropleth layer
 // ------------------------------------------------------
+*/
